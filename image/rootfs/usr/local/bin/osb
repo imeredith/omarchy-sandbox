@@ -1,0 +1,813 @@
+#!/usr/bin/env python3
+"""osb: run and drive the Omarchy VM inside an os-sandbox container.
+
+The container's entrypoint is `osb boot`, which starts QEMU. Everything else
+talks to that VM: input and screenshots go through QEMU's QMP socket (so they
+behave like a real monitor, mouse and keyboard), while commands run in the
+guest over SSH inside the live Hyprland session.
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+RUN_DIR = "/run/osb"
+QMP_SOCK = f"{RUN_DIR}/qmp.sock"
+SERIAL_LOG = f"{RUN_DIR}/serial.log"
+SIZE_FILE = f"{RUN_DIR}/size"
+VFS_SOCK = f"{RUN_DIR}/virtiofs.sock"
+KEY = "/etc/osb/id_ed25519"
+SSH_PORT = 2222
+GUEST_USER = "omarchy"
+ABS_MAX = 0x7FFF
+
+
+def die(msg, code=1):
+    print(f"osb: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        die(f"{name} must be an integer")
+
+
+# --------------------------------------------------------------------------
+# boot
+
+
+def cmd_boot(args):
+    width = env_int("OSB_WIDTH", 1280)
+    height = env_int("OSB_HEIGHT", 800)
+    memory = env_int("OSB_MEMORY", 4096)
+    cpus = env_int("OSB_CPUS", 2)
+
+    os.makedirs(RUN_DIR, exist_ok=True)
+    for stale in (QMP_SOCK, VFS_SOCK):
+        if os.path.exists(stale):
+            os.unlink(stale)
+    with open(SIZE_FILE, "w") as f:
+        f.write(f"{width} {height}\n")
+
+    kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
+    if not kvm:
+        print("osb: /dev/kvm not available, falling back to TCG (very slow). "
+              "Run the container with --device /dev/kvm.", file=sys.stderr)
+
+    # The guest's root filesystem is this container's /. The guest mounts its
+    # own /proc, /sys, /dev, /run and /tmp over the container's, so only real
+    # files are shared.
+    virtiofsd = subprocess.Popen([
+        "/usr/lib/virtiofsd",
+        f"--socket-path={VFS_SOCK}",
+        "--shared-dir=/",
+        "--sandbox=none",
+        "--cache=auto",
+        "--inode-file-handles=never",
+        "--announce-submounts",
+        "--log-level=error",
+    ])
+    for _ in range(100):
+        if os.path.exists(VFS_SOCK):
+            break
+        if virtiofsd.poll() is not None:
+            die("virtiofsd exited during startup")
+        time.sleep(0.05)
+    else:
+        die("virtiofsd did not create its socket")
+
+    qemu = [
+        "qemu-system-x86_64",
+        "-name", "omarchy-sandbox",
+        "-machine", "q35,memory-backend=mem,accel=" + ("kvm" if kvm else "tcg"),
+        "-cpu", "host" if kvm else "max",
+        "-smp", str(cpus),
+        "-m", f"{memory}M",
+        # vhost-user-fs needs guest RAM that virtiofsd can map.
+        "-object", f"memory-backend-memfd,id=mem,size={memory}M,share=on",
+        "-kernel", "/boot/vmlinuz-sandbox",
+        "-initrd", "/boot/initramfs-sandbox.img",
+        "-append", "root=rootfs rootfstype=virtiofs rw console=ttyS0 loglevel=3 quiet",
+        "-chardev", f"socket,id=vfs,path={VFS_SOCK}",
+        "-device", "vhost-user-fs-pci,chardev=vfs,tag=rootfs",
+        "-device", f"virtio-vga,xres={width},yres={height}",
+        "-device", "qemu-xhci",
+        "-device", "usb-tablet",
+        "-device", "usb-kbd",
+        "-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{SSH_PORT}-:22",
+        "-device", "virtio-net-pci,netdev=net0",
+        "-qmp", f"unix:{QMP_SOCK},server=on,wait=off",
+        "-vnc", ":0",
+        "-serial", f"file:{SERIAL_LOG}",
+        "-display", "none",
+        "-monitor", "none",
+        "-nodefaults",
+    ]
+    print(f"osb: booting Omarchy VM ({width}x{height}, {memory} MiB, {cpus} CPUs, "
+          f"{'kvm' if kvm else 'tcg'})", flush=True)
+    vm = subprocess.Popen(qemu)
+
+    def stop(signum, frame):
+        # Ask the guest to power off cleanly, then fall back to killing QEMU.
+        try:
+            q = QMP(timeout=2)
+            q.cmd("system_powerdown")
+            q.close()
+            vm.wait(timeout=20)
+        except (SystemExit, subprocess.TimeoutExpired, OSError):
+            vm.kill()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    code = vm.wait()
+    virtiofsd.terminate()
+    try:
+        virtiofsd.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        virtiofsd.kill()
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------
+# QMP
+
+
+class QMP:
+    def __init__(self, path=QMP_SOCK, timeout=10):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(timeout)
+        try:
+            self.sock.connect(path)
+        except OSError as e:
+            die(f"cannot reach QEMU monitor at {path}: {e} (is the VM running?)")
+        self.buf = b""
+        self._read()  # greeting
+        self.cmd("qmp_capabilities")
+
+    def _read(self):
+        while True:
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                if line.strip():
+                    msg = json.loads(line)
+                    if "event" in msg:
+                        continue
+                    return msg
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                die("QEMU monitor closed the connection")
+            self.buf += chunk
+
+    def cmd(self, execute, **arguments):
+        req = {"execute": execute}
+        if arguments:
+            req["arguments"] = arguments
+        self.sock.sendall(json.dumps(req).encode() + b"\n")
+        resp = self._read()
+        if "error" in resp:
+            die(f"QMP {execute} failed: {resp['error'].get('desc', resp['error'])}")
+        return resp.get("return")
+
+    def close(self):
+        self.sock.close()
+
+
+# --------------------------------------------------------------------------
+# SSH into the guest
+
+
+def ssh_base(timeout=5):
+    return [
+        "ssh", "-q",
+        "-i", KEY,
+        "-p", str(SSH_PORT),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-o", f"ConnectTimeout={timeout}",
+        "-o", "ServerAliveInterval=10",
+        f"{GUEST_USER}@127.0.0.1",
+    ]
+
+
+def guest_argv(command, session=True):
+    """Build the ssh argv to run a shell command string in the guest."""
+    remote = f"bash -lc {shlex.quote(command)}"
+    if session:
+        remote = f"/usr/local/bin/osb-session {remote}"
+    return ssh_base() + ["--", remote]
+
+
+def guest_run(command, timeout=60, session=True, capture=True, stdin=None):
+    try:
+        return subprocess.run(
+            guest_argv(command, session),
+            capture_output=capture,
+            timeout=timeout,
+            input=stdin,
+        )
+    except subprocess.TimeoutExpired:
+        die(f"command timed out after {timeout}s: {command}", 124)
+
+
+def guest_json(command, timeout=30):
+    r = guest_run(command, timeout=timeout)
+    if r.returncode != 0:
+        die(f"`{command}` failed: {r.stderr.decode(errors='replace').strip()}")
+    return json.loads(r.stdout or b"null")
+
+
+# --------------------------------------------------------------------------
+# status / wait
+
+
+def probe():
+    st = {"qemu": False, "ssh": False, "hyprland": False, "shell": False}
+    try:
+        q = QMP(timeout=3)
+        st["qemu"] = q.cmd("query-status").get("status") == "running"
+        q.close()
+    except SystemExit:
+        return st
+    r = subprocess.run(ssh_base(timeout=3) + ["--", "true"], capture_output=True, timeout=15)
+    st["ssh"] = r.returncode == 0
+    if not st["ssh"]:
+        return st
+    r = guest_run("hyprctl -j monitors 2>/dev/null; echo; pgrep -x quickshell >/dev/null && echo shell",
+                  timeout=15)
+    out = r.stdout.decode(errors="replace")
+    st["shell"] = out.rstrip().endswith("shell")
+    try:
+        monitors = json.loads(out.split("\n", 1)[0] or "[]")
+        st["hyprland"] = bool(monitors)
+        if monitors:
+            m = monitors[0]
+            st["monitor"] = {"name": m.get("name"), "width": m.get("width"),
+                             "height": m.get("height"), "scale": m.get("scale")}
+    except json.JSONDecodeError:
+        pass
+    return st
+
+
+def cmd_status(args):
+    st = probe()
+    st["kvm"] = os.access("/dev/kvm", os.R_OK | os.W_OK)
+    st["screen"] = screen_size()
+    print(json.dumps(st, indent=2))
+
+
+def cmd_wait(args):
+    deadline = time.time() + args.timeout
+    st = {}
+    while time.time() < deadline:
+        st = probe()
+        if st.get("hyprland") and (st.get("shell") or not args.shell):
+            if args.settle:
+                time.sleep(args.settle)
+            print(json.dumps(st))
+            return
+        time.sleep(2)
+    print(json.dumps(st), file=sys.stderr)
+    die(f"VM not ready after {args.timeout}s (see {SERIAL_LOG})", 2)
+
+
+# --------------------------------------------------------------------------
+# screenshots
+
+
+def png_size(data):
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    w, h = struct.unpack(">II", data[16:24])
+    return w, h
+
+
+def screen_size():
+    try:
+        with open(SIZE_FILE) as f:
+            w, h = f.read().split()
+            return int(w), int(h)
+    except (OSError, ValueError):
+        return env_int("OSB_WIDTH", 1280), env_int("OSB_HEIGHT", 800)
+
+
+def remember_size(w, h):
+    try:
+        with open(SIZE_FILE, "w") as f:
+            f.write(f"{w} {h}\n")
+    except OSError:
+        pass
+
+
+def find_window(match):
+    clients = guest_json("hyprctl -j clients")
+    if re.fullmatch(r"0x[0-9a-fA-F]+", match):
+        hits = [c for c in clients if c.get("address") == match]
+    else:
+        rx = re.compile(match, re.IGNORECASE)
+        hits = [c for c in clients
+                if rx.search(c.get("class") or "") or rx.search(c.get("title") or "")
+                or rx.search(c.get("initialClass") or "")]
+    if not hits:
+        die(f"no window matches {match!r}")
+    # Prefer a visible, focused window.
+    hits.sort(key=lambda c: (c.get("hidden", False), c.get("focusHistoryID", 99)))
+    return hits[0]
+
+
+def grab_png(region=None, window=None):
+    if window:
+        c = find_window(window)
+        (x, y), (w, h) = c["at"], c["size"]
+        region = (x, y, w, h)
+    if region:
+        x, y, w, h = region
+        r = guest_run(f"grim -g {shlex.quote(f'{x},{y} {w}x{h}')} -", timeout=30)
+        if r.returncode != 0:
+            die(f"grim failed: {r.stderr.decode(errors='replace').strip()}")
+        return r.stdout
+    # Whole display straight from the virtual GPU: works during boot, on the
+    # login screen, or if the compositor has crashed.
+    path = f"{RUN_DIR}/screen.png"
+    q = QMP()
+    q.cmd("screendump", filename=path, format="png")
+    q.close()
+    with open(path, "rb") as f:
+        data = f.read()
+    os.unlink(path)
+    size = png_size(data)
+    if size:
+        remember_size(*size)
+    return data
+
+
+def parse_region(s):
+    m = re.fullmatch(r"\s*(\d+)\s*,\s*(\d+)\s*[, ]\s*(\d+)\s*[x,]\s*(\d+)\s*", s)
+    if not m:
+        raise argparse.ArgumentTypeError("region must look like X,Y,WxH")
+    return tuple(int(v) for v in m.groups())
+
+
+def cmd_screenshot(args):
+    data = grab_png(args.region, args.window)
+    if args.out == "-":
+        sys.stdout.buffer.write(data)
+    else:
+        with open(args.out, "wb") as f:
+            f.write(data)
+        w, h = png_size(data) or (0, 0)
+        print(json.dumps({"path": args.out, "width": w, "height": h}))
+
+
+# --------------------------------------------------------------------------
+# input (QMP: virtual USB tablet + keyboard)
+
+BUTTONS = {"left": "left", "right": "right", "middle": "middle",
+           "back": "side", "forward": "extra"}
+
+KEY_ALIASES = {
+    "ctrl": "ctrl", "control": "ctrl", "lctrl": "ctrl", "rctrl": "ctrl_r",
+    "shift": "shift", "lshift": "shift", "rshift": "shift_r",
+    "alt": "alt", "lalt": "alt", "ralt": "alt_r", "altgr": "alt_r",
+    "super": "meta_l", "meta": "meta_l", "win": "meta_l", "cmd": "meta_l", "mod": "meta_l",
+    "enter": "ret", "return": "ret", "ret": "ret",
+    "esc": "esc", "escape": "esc", "tab": "tab", "space": "spc", "spc": "spc",
+    "backspace": "backspace", "bksp": "backspace", "delete": "delete", "del": "delete",
+    "insert": "insert", "ins": "insert", "home": "home", "end": "end",
+    "pageup": "pgup", "pgup": "pgup", "pagedown": "pgdn", "pgdn": "pgdn",
+    "up": "up", "down": "down", "left": "left", "right": "right",
+    "capslock": "caps_lock", "print": "print", "printscreen": "print", "menu": "menu",
+    "-": "minus", "minus": "minus", "=": "equal", "equal": "equal", "plus": "equal",
+    "[": "bracket_left", "]": "bracket_right", "\\": "backslash",
+    ";": "semicolon", "'": "apostrophe", "`": "grave_accent", "grave": "grave_accent",
+    ",": "comma", "comma": "comma", ".": "dot", "period": "dot", "/": "slash", "slash": "slash",
+    "volumeup": "volumeup", "volumedown": "volumedown", "mute": "audiomute",
+}
+for _c in "abcdefghijklmnopqrstuvwxyz0123456789":
+    KEY_ALIASES[_c] = _c
+for _n in range(1, 13):
+    KEY_ALIASES[f"f{_n}"] = f"f{_n}"
+
+# US layout: character -> (qcode, needs shift)
+CHARMAP = {" ": ("spc", False), "\n": ("ret", False), "\t": ("tab", False)}
+for _c in "abcdefghijklmnopqrstuvwxyz":
+    CHARMAP[_c] = (_c, False)
+    CHARMAP[_c.upper()] = (_c, True)
+for _c in "0123456789":
+    CHARMAP[_c] = (_c, False)
+for _plain, _shifted, _code in [
+    ("-", "_", "minus"), ("=", "+", "equal"), ("[", "{", "bracket_left"),
+    ("]", "}", "bracket_right"), ("\\", "|", "backslash"), (";", ":", "semicolon"),
+    ("'", '"', "apostrophe"), ("`", "~", "grave_accent"), (",", "<", "comma"),
+    (".", ">", "dot"), ("/", "?", "slash"),
+]:
+    CHARMAP[_plain] = (_code, False)
+    CHARMAP[_shifted] = (_code, True)
+for _c, _code in zip("!@#$%^&*()", "1234567890"):
+    CHARMAP[_c] = (_code, True)
+
+
+def key_event(qcode, down):
+    return {"type": "key", "data": {"down": down, "key": {"type": "qcode", "data": qcode}}}
+
+
+def abs_events(x, y):
+    w, h = screen_size()
+    if not (0 <= x < w and 0 <= y < h):
+        die(f"({x}, {y}) is outside the {w}x{h} screen")
+    ax = min(ABS_MAX, int((x + 0.5) * (ABS_MAX + 1) / w))
+    ay = min(ABS_MAX, int((y + 0.5) * (ABS_MAX + 1) / h))
+    return [{"type": "abs", "data": {"axis": "x", "value": ax}},
+            {"type": "abs", "data": {"axis": "y", "value": ay}}]
+
+
+def btn_event(button, down):
+    return {"type": "btn", "data": {"down": down, "button": button}}
+
+
+def send(q, events, pause=0.02):
+    q.cmd("input-send-event", events=events)
+    if pause:
+        time.sleep(pause)
+
+
+def cmd_move(args):
+    q = QMP()
+    send(q, abs_events(args.x, args.y))
+
+
+def cmd_click(args):
+    button = BUTTONS[args.button]
+    q = QMP()
+    send(q, abs_events(args.x, args.y), pause=0.05)
+    mods = [parse_key(m) for m in args.mod or []]
+    for m in mods:
+        send(q, [key_event(m, True)])
+    for i in range(args.count):
+        send(q, [btn_event(button, True)], pause=0.03)
+        send(q, [btn_event(button, False)], pause=0.08)
+    for m in reversed(mods):
+        send(q, [key_event(m, False)])
+
+
+def cmd_mousedown(args):
+    q = QMP()
+    if args.x is not None:
+        send(q, abs_events(args.x, args.y), pause=0.05)
+    send(q, [btn_event(BUTTONS[args.button], True)])
+
+
+def cmd_mouseup(args):
+    q = QMP()
+    if args.x is not None:
+        send(q, abs_events(args.x, args.y), pause=0.05)
+    send(q, [btn_event(BUTTONS[args.button], False)])
+
+
+def cmd_drag(args):
+    button = BUTTONS[args.button]
+    q = QMP()
+    send(q, abs_events(args.x1, args.y1), pause=0.05)
+    send(q, [btn_event(button, True)], pause=0.1)
+    steps = max(1, args.steps)
+    for i in range(1, steps + 1):
+        x = round(args.x1 + (args.x2 - args.x1) * i / steps)
+        y = round(args.y1 + (args.y2 - args.y1) * i / steps)
+        send(q, abs_events(x, y), pause=0.02)
+    time.sleep(0.1)
+    send(q, [btn_event(button, False)])
+
+
+def cmd_scroll(args):
+    q = QMP()
+    if args.x is not None:
+        send(q, abs_events(args.x, args.y), pause=0.05)
+    for amount, neg, pos in ((args.dy, "wheel-up", "wheel-down"),
+                             (args.dx, "wheel-left", "wheel-right")):
+        button = neg if amount < 0 else pos
+        for _ in range(abs(amount)):
+            send(q, [btn_event(button, True)], pause=0)
+            send(q, [btn_event(button, False)], pause=0.03)
+
+
+def parse_key(name):
+    key = name.strip()
+    code = KEY_ALIASES.get(key.lower()) or KEY_ALIASES.get(key)
+    if not code:
+        die(f"unknown key {name!r}")
+    return code
+
+
+def parse_combo(combo):
+    # "ctrl+shift+t", "super+return", "ctrl++" (plus key)
+    parts = re.split(r"\+(?!$)", combo.strip())
+    return [parse_key(p) for p in parts if p != ""]
+
+
+def cmd_key(args):
+    q = QMP()
+    for combo in args.combos:
+        codes = parse_combo(combo)
+        for _ in range(args.repeat):
+            for c in codes:
+                send(q, [key_event(c, True)], pause=0.01)
+            time.sleep(0.03)
+            for c in reversed(codes):
+                send(q, [key_event(c, False)], pause=0.01)
+            time.sleep(0.03)
+
+
+def cmd_type(args):
+    text = args.text if args.text is not None else sys.stdin.read()
+    if all(ch in CHARMAP for ch in text):
+        q = QMP()
+        for ch in text:
+            code, shift = CHARMAP[ch]
+            down = ([key_event("shift", True)] if shift else []) + [key_event(code, True)]
+            up = [key_event(code, False)] + ([key_event("shift", False)] if shift else [])
+            send(q, down, pause=0.008)
+            send(q, up, pause=args.delay / 1000)
+        return
+    # Non-US characters: let the compositor's virtual keyboard type them.
+    r = guest_run(f"wtype -d {int(args.delay)} -", stdin=text.encode(), timeout=120)
+    if r.returncode != 0:
+        die(f"wtype failed: {r.stderr.decode(errors='replace').strip()}")
+
+
+# --------------------------------------------------------------------------
+# guest commands, apps and files
+
+
+def cmd_exec(args):
+    command = " ".join(args.command) if len(args.command) != 1 else args.command[0]
+    if args.root:
+        command = f"sudo -n bash -lc {shlex.quote(command)}"
+    if args.cwd:
+        command = f"cd {shlex.quote(args.cwd)} && {command}"
+    try:
+        r = subprocess.run(guest_argv(command, session=not args.no_session), timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        die(f"timed out after {args.timeout}s", 124)
+    sys.exit(r.returncode)
+
+
+def cmd_shell(args):
+    os.execvp("ssh", ["ssh", "-t"] + ssh_base()[1:] + ["--", "/usr/local/bin/osb-session"])
+
+
+def cmd_launch(args):
+    command = " ".join(args.command) if len(args.command) != 1 else args.command[0]
+    name = args.name or re.sub(r"[^A-Za-z0-9_.-]+", "-", os.path.basename(shlex.split(command)[0]))
+    name = f"{name}-{int(time.time() * 1000) % 10**8}"
+    log = f"~/.cache/osb/logs/{name}.log"
+    if args.cwd:
+        command = f"cd {shlex.quote(args.cwd)} && {command}"
+    before = {c["address"] for c in guest_json("hyprctl -j clients")}
+    # setsid detaches the app from the SSH connection; its output goes to a
+    # log the agent can read back later.
+    script = (
+        f"mkdir -p ~/.cache/osb/logs && "
+        f"setsid -f bash -c {shlex.quote(f'exec {command}')} >{log} 2>&1 </dev/null "
+        f"&& sleep 0.2 && pgrep -nf -- {shlex.quote(command[:60])} || true"
+    )
+    r = guest_run(script, timeout=30)
+    pid = r.stdout.decode().strip().splitlines()
+    result = {"id": name, "log": log.replace("~", f"/home/{GUEST_USER}"),
+              "pid": int(pid[-1]) if pid and pid[-1].isdigit() else None}
+    if args.wait is not None:
+        deadline = time.time() + args.wait
+        new = []
+        while time.time() < deadline:
+            clients = guest_json("hyprctl -j clients")
+            new = [c for c in clients if c["address"] not in before]
+            if args.match:
+                rx = re.compile(args.match, re.IGNORECASE)
+                new = [c for c in new
+                       if rx.search(c.get("class") or "") or rx.search(c.get("title") or "")]
+            if new:
+                break
+            time.sleep(0.5)
+        result["windows"] = [summarize_window(c) for c in new]
+        if not new:
+            result["warning"] = f"no new window appeared within {args.wait}s"
+    print(json.dumps(result, indent=2))
+
+
+def summarize_window(c):
+    return {
+        "address": c.get("address"),
+        "class": c.get("class"),
+        "title": c.get("title"),
+        "pid": c.get("pid"),
+        "workspace": (c.get("workspace") or {}).get("name"),
+        "at": c.get("at"),
+        "size": c.get("size"),
+        "floating": c.get("floating"),
+        "fullscreen": c.get("fullscreen"),
+        "focused": c.get("focusHistoryID") == 0,
+        "xwayland": c.get("xwayland"),
+    }
+
+
+def cmd_windows(args):
+    clients = guest_json("hyprctl -j clients")
+    if args.raw:
+        print(json.dumps(clients, indent=2))
+    else:
+        print(json.dumps([summarize_window(c) for c in clients if c.get("mapped", True)], indent=2))
+
+
+def cmd_wait_window(args):
+    rx = re.compile(args.match, re.IGNORECASE)
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        for c in guest_json("hyprctl -j clients"):
+            if rx.search(c.get("class") or "") or rx.search(c.get("title") or ""):
+                print(json.dumps(summarize_window(c), indent=2))
+                return
+        time.sleep(0.5)
+    die(f"no window matching {args.match!r} within {args.timeout}s", 2)
+
+
+def hypr_dispatch(*args):
+    r = guest_run("hyprctl dispatch " + " ".join(shlex.quote(a) for a in args), timeout=15)
+    out = (r.stdout + r.stderr).decode(errors="replace").strip()
+    if r.returncode != 0 or out.lower() != "ok":
+        die(f"hyprctl dispatch {' '.join(args)} failed: {out}")
+    return out
+
+
+def cmd_focus(args):
+    c = find_window(args.match)
+    hypr_dispatch("focuswindow", f"address:{c['address']}")
+    print(json.dumps(summarize_window(c), indent=2))
+
+
+def cmd_close(args):
+    c = find_window(args.match)
+    if args.kill:
+        guest_run(f"kill -9 {int(c['pid'])}", timeout=15)
+    else:
+        hypr_dispatch("closewindow", f"address:{c['address']}")
+    print(json.dumps(summarize_window(c), indent=2))
+
+
+def cmd_push(args):
+    dest = args.dest
+    r = subprocess.run(
+        ["scp", "-q", "-r", "-P", str(SSH_PORT)] + scp_opts() + [args.src, f"{GUEST_USER}@127.0.0.1:{dest}"]
+    )
+    sys.exit(r.returncode)
+
+
+def cmd_pull(args):
+    r = subprocess.run(
+        ["scp", "-q", "-r", "-P", str(SSH_PORT)] + scp_opts() + [f"{GUEST_USER}@127.0.0.1:{args.src}", args.dest]
+    )
+    sys.exit(r.returncode)
+
+
+def scp_opts():
+    return ["-i", KEY, "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]
+
+
+# --------------------------------------------------------------------------
+
+
+def main():
+    p = argparse.ArgumentParser(prog="osb", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("boot", help="start the VM (container entrypoint)")
+    s.set_defaults(fn=cmd_boot)
+
+    s = sub.add_parser("status", help="report VM, SSH and Hyprland state as JSON")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("wait", help="block until the Omarchy desktop is up")
+    s.add_argument("--timeout", type=int, default=180)
+    s.add_argument("--settle", type=float, default=2.0,
+                   help="extra seconds to wait once ready (default 2)")
+    s.add_argument("--no-shell", dest="shell", action="store_false",
+                   help="don't wait for the Omarchy shell (bar) to start")
+    s.set_defaults(fn=cmd_wait)
+
+    s = sub.add_parser("screenshot", help="capture the screen as PNG")
+    s.add_argument("-o", "--out", default="-", help="output file (default stdout)")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--region", type=parse_region, help="X,Y,WxH in screen pixels")
+    g.add_argument("--window", help="window address (0x...) or class/title regex")
+    s.set_defaults(fn=cmd_screenshot)
+
+    s = sub.add_parser("move", help="move the pointer")
+    s.add_argument("x", type=int)
+    s.add_argument("y", type=int)
+    s.set_defaults(fn=cmd_move)
+
+    s = sub.add_parser("click", help="click at X Y")
+    s.add_argument("x", type=int)
+    s.add_argument("y", type=int)
+    s.add_argument("--button", choices=BUTTONS, default="left")
+    s.add_argument("--count", type=int, default=1, help="2 for double-click")
+    s.add_argument("--mod", action="append", help="modifier to hold (repeatable)")
+    s.set_defaults(fn=cmd_click)
+
+    for name, fn in (("mousedown", cmd_mousedown), ("mouseup", cmd_mouseup)):
+        s = sub.add_parser(name, help=f"{name[5:]} a mouse button, optionally at X Y")
+        s.add_argument("x", type=int, nargs="?")
+        s.add_argument("y", type=int, nargs="?")
+        s.add_argument("--button", choices=BUTTONS, default="left")
+        s.set_defaults(fn=fn)
+
+    s = sub.add_parser("drag", help="press at X1 Y1, move to X2 Y2, release")
+    for a in ("x1", "y1", "x2", "y2"):
+        s.add_argument(a, type=int)
+    s.add_argument("--button", choices=BUTTONS, default="left")
+    s.add_argument("--steps", type=int, default=20)
+    s.set_defaults(fn=cmd_drag)
+
+    s = sub.add_parser("scroll", help="scroll wheel notches (positive dy = down)")
+    s.add_argument("x", type=int, nargs="?")
+    s.add_argument("y", type=int, nargs="?")
+    s.add_argument("--dy", type=int, default=0)
+    s.add_argument("--dx", type=int, default=0)
+    s.set_defaults(fn=cmd_scroll)
+
+    s = sub.add_parser("key", help="press key combos, e.g. super+return ctrl+shift+t")
+    s.add_argument("combos", nargs="+")
+    s.add_argument("--repeat", type=int, default=1)
+    s.set_defaults(fn=cmd_key)
+
+    s = sub.add_parser("type", help="type text (stdin if omitted)")
+    s.add_argument("text", nargs="?")
+    s.add_argument("--delay", type=float, default=12, help="ms between keys")
+    s.set_defaults(fn=cmd_type)
+
+    s = sub.add_parser("exec", help="run a shell command in the guest session")
+    s.add_argument("--timeout", type=int, default=600)
+    s.add_argument("--root", action="store_true", help="run with sudo")
+    s.add_argument("--cwd")
+    s.add_argument("--no-session", action="store_true",
+                   help="don't attach to the Hyprland session environment")
+    s.add_argument("command", nargs="+")
+    s.set_defaults(fn=cmd_exec)
+
+    s = sub.add_parser("shell", help="interactive shell in the guest")
+    s.set_defaults(fn=cmd_shell)
+
+    s = sub.add_parser("launch", help="start a GUI app detached, logging its output")
+    s.add_argument("--name", help="id prefix for the log file")
+    s.add_argument("--cwd")
+    s.add_argument("--wait", type=float, help="seconds to wait for a new window")
+    s.add_argument("--match", help="regex the new window's class/title must match")
+    s.add_argument("command", nargs="+")
+    s.set_defaults(fn=cmd_launch)
+
+    s = sub.add_parser("windows", help="list windows as JSON")
+    s.add_argument("--raw", action="store_true", help="full hyprctl output")
+    s.set_defaults(fn=cmd_windows)
+
+    s = sub.add_parser("wait-window", help="wait for a window whose class/title matches")
+    s.add_argument("match")
+    s.add_argument("--timeout", type=float, default=30)
+    s.set_defaults(fn=cmd_wait_window)
+
+    s = sub.add_parser("focus", help="focus a window (address or class/title regex)")
+    s.add_argument("match")
+    s.set_defaults(fn=cmd_focus)
+
+    s = sub.add_parser("close", help="close a window (address or class/title regex)")
+    s.add_argument("match")
+    s.add_argument("--kill", action="store_true", help="SIGKILL its process instead")
+    s.set_defaults(fn=cmd_close)
+
+    s = sub.add_parser("push", help="copy a container path into the guest")
+    s.add_argument("src")
+    s.add_argument("dest")
+    s.set_defaults(fn=cmd_push)
+
+    s = sub.add_parser("pull", help="copy a guest path into the container")
+    s.add_argument("src")
+    s.add_argument("dest")
+    s.set_defaults(fn=cmd_pull)
+
+    args = p.parse_args()
+    if getattr(args, "x", 0) is None and getattr(args, "y", None) is not None:
+        p.error("give both X and Y")
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

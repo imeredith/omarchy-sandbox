@@ -1,0 +1,33 @@
+#!/bin/bash
+# Run a command inside the omarchy user's live Hyprland session, so tools like
+# hyprctl, grim, wtype and GUI apps reach the compositor from an SSH shell.
+set -euo pipefail
+
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+export OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
+export PATH="$OMARCHY_PATH/bin:$PATH"
+
+# Newest Hyprland instance wins.
+if sig_dir=$(ls -1td "$XDG_RUNTIME_DIR"/hypr/*/ 2>/dev/null | head -n1) && [[ -n $sig_dir ]]; then
+  export HYPRLAND_INSTANCE_SIGNATURE="$(basename "$sig_dir")"
+fi
+if sock=$(ls -1t "$XDG_RUNTIME_DIR"/wayland-[0-9] 2>/dev/null | head -n1) && [[ -n $sock ]]; then
+  export WAYLAND_DISPLAY="$(basename "$sock")"
+fi
+
+# Pick up the session environment (GDK_BACKEND, QT_QPA_PLATFORM, ...) that
+# uwsm exported to the systemd user manager.
+if [[ -S $XDG_RUNTIME_DIR/bus ]]; then
+  while IFS= read -r line; do
+    case "$line" in
+      PATH=* | HOME=* | USER=* | LOGNAME=* | SHELL=* | PWD=* | SHLVL=* | _=*) ;;
+      *=*) export "$line" ;;
+    esac
+  done < <(systemctl --user show-environment 2>/dev/null || true)
+fi
+
+if (($# == 0)); then
+  exec bash -l
+fi
+exec "$@"
