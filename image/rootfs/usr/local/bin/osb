@@ -605,12 +605,18 @@ def cmd_shell(args):
 
 def cmd_launch(args):
     command = shlex.join(args.command) if len(args.command) != 1 else args.command[0]
-    name = args.name or re.sub(r"[^A-Za-z0-9_.-]+", "-", os.path.basename(shlex.split(command)[0]))
+    if not args.name:
+        # Name the log after the program, skipping VAR=value prefixes.
+        words = [w for w in shlex.split(command) if not re.match(r"[A-Za-z_][A-Za-z0-9_]*=", w)]
+        args.name = re.sub(r"[^A-Za-z0-9_.-]+", "-", os.path.basename(words[0] if words else "app"))
+    name = args.name
     name = f"{name}-{int(time.time() * 1000) % 10**8}"
     log = f"~/.cache/osb/logs/{name}.log"
     pidfile = f"~/.cache/osb/logs/{name}.pid"
-    # The detached bash records its own pid, which `exec` hands on to the app.
-    inner = f"exec {command}"
+    # The detached bash records its own pid and execs a nested bash for the
+    # command line (env prefixes, `&&` chains). bash -c execs a simple command
+    # directly, so the pid is the app's; for compound lines it's that shell's.
+    inner = f"exec bash -c {shlex.quote(command)}"
     if args.cwd:
         inner = f"cd {shlex.quote(args.cwd)} && {inner}"
     inner = f"echo $$ >{pidfile} && {inner}"
