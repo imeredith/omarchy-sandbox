@@ -9,14 +9,11 @@
 # throws the sandbox away.
 #
 # `osb` (the entrypoint) boots the VM and drives it: screenshots and input go
-# through QEMU's QMP socket (virtual monitor, USB tablet and keyboard), and
+# through QEMU's QMP socket (virtual monitor, tablet and keyboard), and
 # commands run in the guest's Hyprland session over SSH.
 
 ARG ARCH_IMAGE=archlinux:latest
 FROM ${ARCH_IMAGE}
-
-# Extra packages to bake into the guest (space separated).
-ARG EXTRA_PACKAGES=""
 
 # Bootstrap the Omarchy repo and keyring, then restore signature checking.
 RUN pacman-key --init && pacman-key --populate archlinux \
@@ -37,7 +34,6 @@ RUN pacman -S --noconfirm --needed \
       mesa vulkan-swrast openssh sudo \
       grim slurp wtype wl-clipboard foot alacritty \
       networkmanager polkit \
-      ${EXTRA_PACKAGES} \
  && yes | pacman -Scc
 
 # The VM host side (QEMU + virtiofsd) and what omarchy-provision-user needs.
@@ -47,11 +43,32 @@ RUN pacman -S --noconfirm --needed \
       virtiofsd python xdg-user-dirs \
  && yes | pacman -Scc
 
+# The parts of Omarchy's ISO package list (install/omarchy-base.packages) that
+# make up the desktop apps under test interact with: terminal launcher,
+# portals, default browser, file manager, viewers, fonts, themes, input method
+# and the CLI tools its shell config expects. Hardware, printing, containers
+# and big office/creative apps are left out; add them with EXTRA_PACKAGES.
+RUN pacman -S --noconfirm --needed \
+      xdg-terminal-exec xdg-desktop-portal-gtk chromium nautilus sushi evince imv mpv \
+      noto-fonts noto-fonts-emoji woff2-font-awesome yaru-icon-theme gnome-themes-extra qt6-imageformats \
+      fcitx5 fcitx5-gtk fcitx5-qt \
+      bash-completion bat btop eza fd fzf jq less man-db nvim ripgrep starship tmux unzip zoxide \
+      inetutils whois alsa-utils pamixer brightnessctl hyprpicker hyprsunset imagemagick \
+      ffmpegthumbnailer inotify-tools socat python-gobject \
+ && yes | pacman -Scc
+
+# Extra packages to bake into the guest (space separated), e.g. the toolchain
+# for the app under test.
+ARG EXTRA_PACKAGES=""
+RUN if [ -n "$EXTRA_PACKAGES" ]; then \
+      pacman -S --noconfirm --needed $EXTRA_PACKAGES && yes | pacman -Scc; \
+    fi
+
 COPY rootfs/ /
 
 # Sandbox user (password "omarchy", passwordless sudo) with Omarchy's skel.
 # The SSH key only ever travels between the container and its own VM.
-RUN useradd -m -G wheel -s /bin/bash omarchy \
+RUN useradd -m -G wheel,systemd-journal -s /bin/bash omarchy \
  && echo 'omarchy:omarchy' | chpasswd \
  && echo 'omarchy ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/10-omarchy \
  && chmod 440 /etc/sudoers.d/10-omarchy \
@@ -85,6 +102,10 @@ RUN cat > /home/omarchy/.config/hypr/monitors.lua <<'EOF' && chown omarchy:omarc
 hl.env("GDK_SCALE", "1")
 hl.monitor({ output = "", mode = "preferred", position = "auto", scale = 1 })
 EOF
+
+# Omarchy's default terminal (super+return) is foot.
+RUN printf 'foot.desktop\n' > /home/omarchy/.config/xdg-terminals.list \
+ && chown omarchy:omarchy /home/omarchy/.config/xdg-terminals.list
 
 # Initramfs that mounts the virtiofs root, using the sandbox hooks only.
 RUN rm -f /etc/mkinitcpio.conf.d/omarchy_*.conf /etc/mkinitcpio.conf.d/thunderbolt_module.conf \

@@ -101,9 +101,10 @@ def cmd_boot(args):
         "-chardev", f"socket,id=vfs,path={VFS_SOCK}",
         "-device", "vhost-user-fs-pci,chardev=vfs,tag=rootfs",
         "-device", f"virtio-vga,xres={width},yres={height}",
-        "-device", "qemu-xhci",
-        "-device", "usb-tablet",
-        "-device", "usb-kbd",
+        # virtio input queues events instead of being polled like USB HID,
+        # so fast synthetic typing doesn't drop key releases.
+        "-device", "virtio-tablet-pci",
+        "-device", "virtio-keyboard-pci",
         "-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{SSH_PORT}-:22",
         "-device", "virtio-net-pci,netdev=net0",
         "-qmp", f"unix:{QMP_SOCK},server=on,wait=off",
@@ -118,13 +119,20 @@ def cmd_boot(args):
     vm = subprocess.Popen(qemu)
 
     def stop(signum, frame):
-        # Ask the guest to power off cleanly, then fall back to killing QEMU.
+        # Power the guest off cleanly, then fall back to killing QEMU. Omarchy
+        # ignores the (ACPI) power button, so ask systemd over SSH first.
+        r = subprocess.run(ssh_base(timeout=2) + ["--", "sudo -n systemctl poweroff"],
+                           capture_output=True, timeout=10)
+        if r.returncode not in (0, 255):  # 255: the connection dropped as it went down
+            try:
+                q = QMP(timeout=2, quiet=True)
+                q.cmd("system_powerdown")
+                q.close()
+            except (SystemExit, OSError):
+                pass
         try:
-            q = QMP(timeout=2)
-            q.cmd("system_powerdown")
-            q.close()
-            vm.wait(timeout=20)
-        except (SystemExit, subprocess.TimeoutExpired, OSError):
+            vm.wait(timeout=25)
+        except subprocess.TimeoutExpired:
             vm.kill()
 
     signal.signal(signal.SIGTERM, stop)
@@ -143,12 +151,14 @@ def cmd_boot(args):
 
 
 class QMP:
-    def __init__(self, path=QMP_SOCK, timeout=10):
+    def __init__(self, path=QMP_SOCK, timeout=10, quiet=False):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(timeout)
         try:
             self.sock.connect(path)
         except OSError as e:
+            if quiet:
+                sys.exit(1)
             die(f"cannot reach QEMU monitor at {path}: {e} (is the VM running?)")
         self.buf = b""
         self._read()  # greeting
@@ -234,7 +244,7 @@ def guest_json(command, timeout=30):
 def probe():
     st = {"qemu": False, "ssh": False, "hyprland": False, "shell": False}
     try:
-        q = QMP(timeout=3)
+        q = QMP(timeout=3, quiet=True)
         st["qemu"] = q.cmd("query-status").get("status") == "running"
         q.close()
     except SystemExit:
@@ -243,12 +253,14 @@ def probe():
     st["ssh"] = r.returncode == 0
     if not st["ssh"]:
         return st
-    r = guest_run("hyprctl -j monitors 2>/dev/null; echo; pgrep -x quickshell >/dev/null && echo shell",
+    # hyprctl's JSON spans several lines; the shell check goes on a last line of its own.
+    r = guest_run("hyprctl -j monitors 2>/dev/null; echo; "
+                  "pgrep -x quickshell >/dev/null && echo shell=1 || echo shell=0",
                   timeout=15)
-    out = r.stdout.decode(errors="replace")
-    st["shell"] = out.rstrip().endswith("shell")
+    out, _, last = r.stdout.decode(errors="replace").rstrip().rpartition("\n")
+    st["shell"] = last == "shell=1"
     try:
-        monitors = json.loads(out.split("\n", 1)[0] or "[]")
+        monitors = json.loads(out.strip() or "[]")
         st["hyprland"] = bool(monitors)
         if monitors:
             m = monitors[0]
@@ -266,12 +278,38 @@ def cmd_status(args):
     print(json.dumps(st, indent=2))
 
 
+FIRST_RUN_CLEARED = f"{RUN_DIR}/first-run-cleared"
+
+
+def clear_first_run_notifications():
+    """Dismiss Omarchy's first-login toasts (welcome, update prompt) once.
+
+    They are persistent and cover the top-right corner of the screen. The
+    update prompt only appears once the network is up, so wait for first-run
+    and its nm-online check to finish first.
+    """
+    if os.path.exists(FIRST_RUN_CLEARED):
+        return
+    guest_run(
+        "for _ in $(seq 60); do "
+        "omarchy-done check first-run-user && ! pgrep -x nm-online >/dev/null && break; "
+        "sleep 0.5; done; sleep 0.5; omarchy-shell -q notifications dismissAll",
+        timeout=60,
+    )
+    try:
+        open(FIRST_RUN_CLEARED, "w").close()
+    except OSError:
+        pass
+
+
 def cmd_wait(args):
     deadline = time.time() + args.timeout
     st = {}
     while time.time() < deadline:
         st = probe()
         if st.get("hyprland") and (st.get("shell") or not args.shell):
+            if args.shell and not args.keep_notifications:
+                clear_first_run_notifications()
             if args.settle:
                 time.sleep(args.settle)
             print(json.dumps(st))
@@ -370,7 +408,7 @@ def cmd_screenshot(args):
 
 
 # --------------------------------------------------------------------------
-# input (QMP: virtual USB tablet + keyboard)
+# input (QMP: virtio tablet + keyboard)
 
 BUTTONS = {"left": "left", "right": "right", "middle": "middle",
            "back": "side", "forward": "extra"}
@@ -549,7 +587,7 @@ def cmd_type(args):
 
 
 def cmd_exec(args):
-    command = " ".join(args.command) if len(args.command) != 1 else args.command[0]
+    command = shlex.join(args.command) if len(args.command) != 1 else args.command[0]
     if args.root:
         command = f"sudo -n bash -lc {shlex.quote(command)}"
     if args.cwd:
@@ -566,7 +604,7 @@ def cmd_shell(args):
 
 
 def cmd_launch(args):
-    command = " ".join(args.command) if len(args.command) != 1 else args.command[0]
+    command = shlex.join(args.command) if len(args.command) != 1 else args.command[0]
     name = args.name or re.sub(r"[^A-Za-z0-9_.-]+", "-", os.path.basename(shlex.split(command)[0]))
     name = f"{name}-{int(time.time() * 1000) % 10**8}"
     log = f"~/.cache/osb/logs/{name}.log"
@@ -651,26 +689,33 @@ def cmd_wait_window(args):
     die(f"no window matching {args.match!r} within {args.timeout}s", 2)
 
 
-def hypr_dispatch(*args):
-    r = guest_run("hyprctl dispatch " + " ".join(shlex.quote(a) for a in args), timeout=15)
-    out = (r.stdout + r.stderr).decode(errors="replace").strip()
-    if r.returncode != 0 or out.lower() != "ok":
-        die(f"hyprctl dispatch {' '.join(args)} failed: {out}")
-    return out
+def hypr_dispatch(lua, *legacy):
+    """Run a dispatcher: Lua syntax (Hyprland >= 0.55), else the legacy form."""
+    out = ""
+    for args in ([lua], list(legacy)):
+        if not args:
+            continue
+        r = guest_run("hyprctl dispatch " + " ".join(shlex.quote(a) for a in args), timeout=15)
+        out = (r.stdout + r.stderr).decode(errors="replace").strip()
+        if r.returncode == 0 and out.lower() == "ok":
+            return out
+    die(f"hyprctl dispatch {lua} failed: {out}")
 
 
 def cmd_focus(args):
     c = find_window(args.match)
-    hypr_dispatch("focuswindow", f"address:{c['address']}")
+    addr = c["address"]
+    hypr_dispatch(f'hl.dsp.focus({{ window = "address:{addr}" }})', "focuswindow", f"address:{addr}")
     print(json.dumps(summarize_window(c), indent=2))
 
 
 def cmd_close(args):
     c = find_window(args.match)
+    addr = c["address"]
     if args.kill:
         guest_run(f"kill -9 {int(c['pid'])}", timeout=15)
     else:
-        hypr_dispatch("closewindow", f"address:{c['address']}")
+        hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})', "closewindow", f"address:{addr}")
     print(json.dumps(summarize_window(c), indent=2))
 
 
@@ -714,6 +759,8 @@ def main():
                    help="extra seconds to wait once ready (default 2)")
     s.add_argument("--no-shell", dest="shell", action="store_false",
                    help="don't wait for the Omarchy shell (bar) to start")
+    s.add_argument("--keep-notifications", action="store_true",
+                   help="leave Omarchy's first-login notifications on screen")
     s.set_defaults(fn=cmd_wait)
 
     s = sub.add_parser("screenshot", help="capture the screen as PNG")
