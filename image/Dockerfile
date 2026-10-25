@@ -113,11 +113,10 @@ EOF
 RUN printf 'foot.desktop\n' > /home/omarchy/.config/xdg-terminals.list \
  && chown omarchy:omarchy /home/omarchy/.config/xdg-terminals.list
 
-# Initramfs that mounts the virtiofs root, using the sandbox hooks only.
+# Initramfs that mounts the virtiofs root, using the sandbox hooks only, for
+# the newest installed kernel. `osb boot` redoes this if the kernel changes.
 RUN rm -f /etc/mkinitcpio.conf.d/omarchy_*.conf /etc/mkinitcpio.conf.d/thunderbolt_module.conf \
- && kver="$(ls /usr/lib/modules | head -n1)" \
- && mkinitcpio -k "$kver" -g /boot/initramfs-sandbox.img \
- && ln -sf "/usr/lib/modules/$kver/vmlinuz" /boot/vmlinuz-sandbox
+ && /usr/local/bin/osb kernel
 
 RUN printf '# Root is the container filesystem, mounted over virtiofs by the initramfs.\n' > /etc/fstab \
  && ln -sf /usr/share/zoneinfo/UTC /etc/localtime \

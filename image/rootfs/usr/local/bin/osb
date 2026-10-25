@@ -25,6 +25,9 @@ SERIAL_LOG = f"{RUN_DIR}/serial.log"
 SIZE_FILE = f"{RUN_DIR}/size"
 VFS_SOCK = f"{RUN_DIR}/virtiofs.sock"
 KEY = "/etc/osb/id_ed25519"
+KERNEL = "/boot/vmlinuz-sandbox"
+INITRAMFS = "/boot/initramfs-sandbox.img"
+INITRAMFS_KVER = "/boot/initramfs-sandbox.kver"
 SSH_PORT = 2222
 GUEST_USER = "omarchy"
 ABS_MAX = 0x7FFF
@@ -60,6 +63,7 @@ def cmd_boot(args):
         f.write(f"{width} {height}\n")
 
     ensure_ssh_key()
+    prepare_kernel()
 
     kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
     if not kvm:
@@ -97,8 +101,8 @@ def cmd_boot(args):
         "-m", f"{memory}M",
         # vhost-user-fs needs guest RAM that virtiofsd can map.
         "-object", f"memory-backend-memfd,id=mem,size={memory}M,share=on",
-        "-kernel", "/boot/vmlinuz-sandbox",
-        "-initrd", "/boot/initramfs-sandbox.img",
+        "-kernel", KERNEL,
+        "-initrd", INITRAMFS,
         "-append", "root=rootfs rootfstype=virtiofs rw console=ttyS0 loglevel=3 quiet",
         "-chardev", f"socket,id=vfs,path={VFS_SOCK}",
         "-device", "vhost-user-fs-pci,chardev=vfs,tag=rootfs",
@@ -146,6 +150,45 @@ def cmd_boot(args):
     except subprocess.TimeoutExpired:
         virtiofsd.kill()
     sys.exit(code)
+
+
+def prepare_kernel(force=False):
+    """Point the sandbox kernel and initramfs at the newest installed kernel.
+
+    QEMU boots /boot/vmlinuz-sandbox directly, so after a kernel upgrade (in a
+    derived image, or `pacman -Syu` in the guest followed by a restart) the old
+    kernel's modules are gone. Rebuild the virtiofs initramfs whenever the
+    installed kernel differs from the one it was built for.
+    """
+    kvers = [d for d in os.listdir("/usr/lib/modules")
+             if os.path.exists(f"/usr/lib/modules/{d}/vmlinuz")]
+    if not kvers:
+        die("no kernel installed under /usr/lib/modules")
+    kver = max(kvers, key=lambda v: [int(p) if p.isdigit() else p
+                                     for p in re.split(r"(\d+)", v)])
+    try:
+        with open(INITRAMFS_KVER) as f:
+            built = f.read().strip()
+    except OSError:
+        built = None
+    if not force and built == kver and os.path.exists(KERNEL) and os.path.exists(INITRAMFS):
+        return
+    print(f"osb: building the sandbox initramfs for kernel {kver}", flush=True)
+    r = subprocess.run(["mkinitcpio", "-k", kver, "-g", INITRAMFS],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        die(f"mkinitcpio failed for kernel {kver}:\n{r.stderr.strip()}")
+    tmp = KERNEL + ".new"
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(f"/usr/lib/modules/{kver}/vmlinuz", tmp)
+    os.replace(tmp, KERNEL)
+    with open(INITRAMFS_KVER, "w") as f:
+        f.write(kver + "\n")
+
+
+def cmd_kernel(args):
+    prepare_kernel(force=args.force)
 
 
 def ensure_ssh_key():
@@ -796,6 +839,10 @@ def main():
 
     s = sub.add_parser("boot", help="start the VM (container entrypoint)")
     s.set_defaults(fn=cmd_boot)
+
+    s = sub.add_parser("kernel", help="rebuild the sandbox initramfs if the kernel changed")
+    s.add_argument("--force", action="store_true", help="rebuild even if it is up to date")
+    s.set_defaults(fn=cmd_kernel)
 
     s = sub.add_parser("status", help="report VM, SSH and Hyprland state as JSON")
     s.set_defaults(fn=cmd_status)

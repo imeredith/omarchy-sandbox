@@ -93,7 +93,13 @@ async function osbRaw(sandbox: string, args: string[], opts: { timeoutMs?: numbe
     timeoutMs: opts.timeoutMs ?? 120_000,
     input: opts.input,
   });
-  if (r.code !== 0 && /No such container|is not running/.test(r.stderr)) {
+  // Only Docker's own errors mean the sandbox is down; for `exec`, stderr is
+  // the guest command's, which may say anything.
+  if (
+    r.code !== 0 &&
+    /^Error( response from daemon)?: (No such container|container .* is not running)/m.test(r.stderr) &&
+    (await containerState(sandbox)) !== "running"
+  ) {
     throw new ToolError(`sandbox "${sandbox}" is not running; start it with sandbox_start`);
   }
   return r;

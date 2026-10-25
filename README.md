@@ -136,6 +136,7 @@ JSON.
 | `osb focus MATCH` / `osb close MATCH [--kill]` | Focus or close a window |
 | `osb push SRC DEST` / `osb pull SRC DEST` | Copy between the container and the guest (as `omarchy`) |
 | `osb shell` | Interactive shell in the session (`docker exec -it`) |
+| `osb kernel [--force]` | Rebuild the VM's initramfs for the newest installed kernel (`osb boot` does this when the kernel changes) |
 
 `exec` and `launch` take a single shell command line (`osb exec -- 'make && ./app'`).
 If you pass several arguments instead, they are quoted as separate words.
@@ -244,7 +245,9 @@ The source label links the package to its repository. Then point the MCP
 server at it with `OSB_IMAGE=ghcr.io/<owner>/omarchy-sandbox:latest`. Arch is a
 rolling release, so rebuild and push from time to time. To add packages to a
 published image, build `FROM ghcr.io/<owner>/omarchy-sandbox` and run
-`pacman -Syu --noconfirm <packages>`.
+`pacman -Syu --noconfirm <packages>`. If that upgrades the kernel, the VM's
+initramfs is rebuilt on the next `osb boot` (a few seconds, once). The same
+goes for a `sudo pacman -Syu` inside a sandbox followed by a restart.
 
 ## License
 
