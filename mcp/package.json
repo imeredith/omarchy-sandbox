@@ -1,0 +1,30 @@
+{
+  "name": "os-sandbox-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that starts throwaway Omarchy desktops (the os-sandbox Docker image) and lets agents drive them",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "os-sandbox-mcp": "dist/server.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/server.js",
+    "prepare": "tsc"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}

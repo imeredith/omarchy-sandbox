@@ -570,20 +570,32 @@ def cmd_launch(args):
     name = args.name or re.sub(r"[^A-Za-z0-9_.-]+", "-", os.path.basename(shlex.split(command)[0]))
     name = f"{name}-{int(time.time() * 1000) % 10**8}"
     log = f"~/.cache/osb/logs/{name}.log"
+    pidfile = f"~/.cache/osb/logs/{name}.pid"
+    # The detached bash records its own pid, which `exec` hands on to the app.
+    inner = f"exec {command}"
     if args.cwd:
-        command = f"cd {shlex.quote(args.cwd)} && {command}"
+        inner = f"cd {shlex.quote(args.cwd)} && {inner}"
+    inner = f"echo $$ >{pidfile} && {inner}"
     before = {c["address"] for c in guest_json("hyprctl -j clients")}
     # setsid detaches the app from the SSH connection; its output goes to a
     # log the agent can read back later.
     script = (
         f"mkdir -p ~/.cache/osb/logs && "
-        f"setsid -f bash -c {shlex.quote(f'exec {command}')} >{log} 2>&1 </dev/null "
-        f"&& sleep 0.2 && pgrep -nf -- {shlex.quote(command[:60])} || true"
+        f"setsid -f bash -c {shlex.quote(inner)} >{log} 2>&1 </dev/null && "
+        f"for _ in $(seq 20); do [ -s {pidfile} ] && break; sleep 0.1; done; "
+        f"cat {pidfile} 2>/dev/null; true"
     )
     r = guest_run(script, timeout=30)
     pid = r.stdout.decode().strip().splitlines()
     result = {"id": name, "log": log.replace("~", f"/home/{GUEST_USER}"),
               "pid": int(pid[-1]) if pid and pid[-1].isdigit() else None}
+    if result["pid"]:
+        time.sleep(0.3)
+        alive = guest_run(f"kill -0 {result['pid']}", timeout=15).returncode == 0
+        if not alive:
+            tail = guest_run(f"tail -n 20 {log}", timeout=15).stdout.decode(errors="replace")
+            result["exited"] = True
+            result["log_tail"] = tail
     if args.wait is not None:
         deadline = time.time() + args.wait
         new = []
