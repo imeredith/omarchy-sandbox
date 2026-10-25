@@ -59,6 +59,8 @@ def cmd_boot(args):
     with open(SIZE_FILE, "w") as f:
         f.write(f"{width} {height}\n")
 
+    ensure_ssh_key()
+
     kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
     if not kvm:
         print("osb: /dev/kvm not available, falling back to TCG (very slow). "
@@ -108,7 +110,7 @@ def cmd_boot(args):
         "-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{SSH_PORT}-:22",
         "-device", "virtio-net-pci,netdev=net0",
         "-qmp", f"unix:{QMP_SOCK},server=on,wait=off",
-        "-vnc", ":0",
+        *vnc_args(),
         "-serial", f"file:{SERIAL_LOG}",
         "-display", "none",
         "-monitor", "none",
@@ -144,6 +146,45 @@ def cmd_boot(args):
     except subprocess.TimeoutExpired:
         virtiofsd.kill()
     sys.exit(code)
+
+
+def ensure_ssh_key():
+    """Give this container its own key for reaching its VM.
+
+    The key is made on first boot rather than baked into the image, so a
+    published image carries no private key and no two sandboxes share one.
+    The guest's root is this container's /, so authorizing it here is enough.
+    """
+    if os.path.exists(KEY):
+        return
+    os.makedirs(os.path.dirname(KEY), mode=0o700, exist_ok=True)
+    for stale in (KEY, KEY + ".pub"):
+        if os.path.exists(stale):
+            os.unlink(stale)
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "osb", "-f", KEY],
+                   check=True)
+    home = f"/home/{GUEST_USER}"
+    subprocess.run(["install", "-d", "-m", "700", "-o", GUEST_USER, "-g", GUEST_USER,
+                    f"{home}/.ssh"], check=True)
+    subprocess.run(["install", "-m", "600", "-o", GUEST_USER, "-g", GUEST_USER,
+                    KEY + ".pub", f"{home}/.ssh/authorized_keys"], check=True)
+
+
+def vnc_args():
+    """QEMU's VNC server on :5900, password-protected if OSB_VNC_PASSWORD is set.
+
+    VNC authentication only uses the first 8 characters, so this keeps out
+    other containers and casual access, nothing more.
+    """
+    password = os.environ.get("OSB_VNC_PASSWORD", "")
+    if not password:
+        return ["-vnc", ":0"]
+    secret = f"{RUN_DIR}/vnc-password"
+    fd = os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(password)
+    return ["-object", f"secret,id=vncpw,file={secret}",
+            "-vnc", ":0,password-secret=vncpw"]
 
 
 # --------------------------------------------------------------------------

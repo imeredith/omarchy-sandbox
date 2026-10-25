@@ -48,7 +48,7 @@ host ── docker exec osb … ──▶ container: osb ──QMP──▶ QEMU
 - Linux with Docker.
 - `/dev/kvm` (hardware virtualisation). Without it QEMU falls back to software
   emulation, which works but is far too slow to be useful.
-- About 4 GB of free RAM per running sandbox (configurable) and about 5 GB of
+- About 4 GB of free RAM per running sandbox (configurable) and about 6 GB of
   disk for the image.
 
 ## The image
@@ -84,7 +84,9 @@ docker exec osb-default osb wait     # blocks until the desktop is up (about 15 
 - `--stop-timeout 30` gives `docker stop` time to shut the guest down cleanly
   (usually under 10 s) before Docker kills it.
 - `-p 127.0.0.1:5900:5900` publishes the VNC view on localhost only. The VNC
-  server has **no password**, so never publish it on other interfaces.
+  server has **no password** unless you set `OSB_VNC_PASSWORD`, so never
+  publish it on other interfaces. Other containers on the same Docker network
+  can reach port 5900 directly; set a password if that matters.
 - `-v …:/workspace` is optional. The directory appears at `/workspace` and
   `~/workspace` in the guest.
 - `--hostname` is optional. It sets the hostname the guest sees, which
@@ -97,13 +99,16 @@ docker exec osb-default osb wait     # blocks until the desktop is up (about 15 
   | `OSB_HEIGHT` | 800 | Screen height in pixels |
   | `OSB_MEMORY` | 4096 | Guest RAM in MiB |
   | `OSB_CPUS` | 2 | Guest vCPUs |
+  | `OSB_VNC_PASSWORD` | unset | VNC password. VNC only uses the first 8 characters |
 
 Watch the desktop with any VNC client, for example `vncviewer 127.0.0.1:5900`.
 `docker stop` powers the guest off cleanly. `docker start` boots it again with
 its state intact. `docker rm` discards it.
 
 The guest user is `omarchy` (password `omarchy`, passwordless sudo, and it can
-read the system journal). The first `osb wait` dismisses Omarchy's
+read the system journal). The password is not a secret: sshd only accepts the
+key `osb boot` generates in each container on its first boot, so the password
+only unlocks the screen locker. The first `osb wait` dismisses Omarchy's
 first-login notifications ("Learn Keybindings", "Update System"), because they
 stay on screen and cover the top-right corner. Pass `--keep-notifications` to
 leave them.
@@ -184,6 +189,7 @@ Environment variables:
 
 - `OSB_IMAGE`: the image to run (default `os-sandbox:latest`).
 - `OSB_DOCKER`: the docker binary (default `docker`).
+- `OSB_VNC_PASSWORD`: if set, passed to new sandboxes as their VNC password.
 
 Every tool takes an optional `sandbox` name (default `"default"`), so an agent
 can run several sandboxes at once. Each sandbox is a container named
@@ -214,6 +220,36 @@ A typical agent loop:
 protocol. It starts a sandbox named `smoke`, uses every tool and then removes
 the sandbox.
 
+## Publishing the image
+
+The image holds no secrets, so it can be pushed to a public registry:
+
+- The SSH key `osb` uses to reach the VM is generated in each container on its
+  first boot (`/etc/osb/id_ed25519`), not at build time.
+- The secret half of the pacman keyring's local master key is deleted in the
+  layer that creates it. To sign a new key locally in a derived image, run
+  `pacman-key --init` first.
+- SSH host keys and `/etc/machine-id` are created by the guest on first boot,
+  so each sandbox gets its own.
+- The `omarchy` password is public, as described above.
+
+For example, to GitHub's registry (with a token that has `write:packages`):
+
+```sh
+docker build -t ghcr.io/<owner>/os-sandbox:latest \
+  --label org.opencontainers.image.source=https://github.com/<owner>/os-sandbox \
+  image/
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u <owner> --password-stdin
+docker push ghcr.io/<owner>/os-sandbox:latest
+```
+
+The source label links the package to its repository. Then point the MCP
+server at it with `OSB_IMAGE=ghcr.io/<owner>/os-sandbox:latest`. Arch is a
+rolling release, so rebuild and push from time to time. To add packages to a
+published image, build `FROM ghcr.io/<owner>/os-sandbox` and run
+`pacman -Syu --noconfirm <packages>`.
+
 ## License
 
-To be decided.
+MIT, see [LICENSE](LICENSE). The image also contains Arch Linux, Omarchy and
+other software, each under its own license.

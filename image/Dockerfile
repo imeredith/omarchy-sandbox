@@ -15,12 +15,24 @@
 ARG ARCH_IMAGE=archlinux:latest
 FROM ${ARCH_IMAGE}
 
+LABEL org.opencontainers.image.title="os-sandbox" \
+      org.opencontainers.image.description="Omarchy (Arch + Hyprland) desktop in a QEMU VM, driven by agents through osb and the os-sandbox MCP server" \
+      org.opencontainers.image.licenses="MIT"
+
 # Bootstrap the Omarchy repo and keyring, then restore signature checking.
+# pacman-key --init makes a local master key to sign the distribution keys
+# with. Its secret half is deleted in this same layer, as the archlinux image
+# does, so the published image doesn't ship a key every user would trust.
+# Verifying packages only needs the public keyring.
 RUN pacman-key --init && pacman-key --populate archlinux \
  && printf '\n[omarchy]\nSigLevel = Optional TrustAll\nServer = https://pkgs.omarchy.org/stable/$arch\n' >> /etc/pacman.conf \
  && pacman -Syu --noconfirm omarchy-keyring \
  && pacman-key --populate omarchy \
- && sed -i '/^SigLevel = Optional TrustAll$/d' /etc/pacman.conf
+ && sed -i '/^SigLevel = Optional TrustAll$/d' /etc/pacman.conf \
+ && gpgconf --homedir /etc/pacman.d/gnupg --kill all \
+ && rm -rf /etc/pacman.d/gnupg/openpgp-revocs.d /etc/pacman.d/gnupg/private-keys-v1.d \
+           /etc/pacman.d/gnupg/pubring.gpg~ /etc/pacman.d/gnupg/S.* \
+ && yes | pacman -Scc
 
 # The archlinux image skips man pages, docs and locales; a VM should be complete.
 RUN sed -i '/^NoExtract/d' /etc/pacman.conf
@@ -67,15 +79,13 @@ RUN if [ -n "$EXTRA_PACKAGES" ]; then \
 COPY rootfs/ /
 
 # Sandbox user (password "omarchy", passwordless sudo) with Omarchy's skel.
-# The SSH key only ever travels between the container and its own VM.
+# The password is public; it only unlocks the screen locker, since sshd takes
+# keys only. `osb boot` makes the SSH key on first boot, so the image has none.
 RUN useradd -m -G wheel,systemd-journal -s /bin/bash omarchy \
  && echo 'omarchy:omarchy' | chpasswd \
  && echo 'omarchy ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/10-omarchy \
  && chmod 440 /etc/sudoers.d/10-omarchy \
- && mkdir -p /etc/osb /workspace \
- && ssh-keygen -q -t ed25519 -N '' -C osb -f /etc/osb/id_ed25519 \
- && install -d -m 700 -o omarchy -g omarchy /home/omarchy/.ssh \
- && install -m 600 -o omarchy -g omarchy /etc/osb/id_ed25519.pub /home/omarchy/.ssh/authorized_keys \
+ && mkdir -p /workspace \
  && chown omarchy:omarchy /workspace \
  && ln -s /workspace /home/omarchy/workspace
 
@@ -124,7 +134,8 @@ ENV OSB_WIDTH=1280 \
     OSB_MEMORY=4096 \
     OSB_CPUS=2
 
-# 5900: VNC view of the VM display (no password; publish on localhost only).
+# 5900: VNC view of the VM display. No password unless OSB_VNC_PASSWORD is
+# set, so publish it on localhost only.
 EXPOSE 5900
 VOLUME ["/workspace"]
 ENTRYPOINT ["/usr/local/bin/osb", "boot"]

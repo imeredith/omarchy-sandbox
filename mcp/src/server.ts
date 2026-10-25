@@ -222,6 +222,9 @@ server.registerTool(
         "-e", `OSB_MEMORY=${a.memory_mb}`,
         "-e", `OSB_CPUS=${a.cpus}`,
       ];
+      // Docker reads the value from this process's environment, so the
+      // password stays out of argv.
+      if (process.env.OSB_VNC_PASSWORD) args.push("-e", "OSB_VNC_PASSWORD");
       if (existsSync("/dev/kvm")) args.push("--device", "/dev/kvm");
       if (a.workspace) {
         const dir = path.resolve(a.workspace);
