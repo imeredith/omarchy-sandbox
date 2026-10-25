@@ -1,11 +1,11 @@
 {
-  "name": "os-sandbox-mcp",
+  "name": "omarchy-sandbox-mcp",
   "version": "0.1.0",
-  "description": "MCP server that starts throwaway Omarchy desktops (the os-sandbox Docker image) and lets agents drive them",
+  "description": "MCP server that starts throwaway Omarchy desktops (the omarchy-sandbox Docker image) and lets agents drive them",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "os-sandbox-mcp": "dist/server.js"
+    "omarchy-sandbox-mcp": "dist/server.js"
   },
   "files": [
     "dist"

@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /**
- * os-sandbox MCP server.
+ * omarchy-sandbox MCP server.
  *
- * Starts throwaway Omarchy desktops (containers of the os-sandbox image, each
+ * Starts throwaway Omarchy desktops (containers of the omarchy-sandbox image, each
  * booting an Omarchy VM) and exposes the `osb` CLI inside them as tools:
  * screenshots, mouse and keyboard input, commands in the Hyprland session,
  * app launching, window management and file transfer.
  *
  * Every tool shells out to `docker run` / `docker exec <container> osb ...`,
  * so the server holds no state of its own: sandboxes are just containers
- * labelled `os-sandbox` and named `osb-<name>`.
+ * labelled `omarchy-sandbox` and named `osb-<name>`.
  */
 
 import { spawn } from "node:child_process";
@@ -22,8 +22,8 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 const DOCKER = process.env.OSB_DOCKER ?? "docker";
-const IMAGE = process.env.OSB_IMAGE ?? "os-sandbox:latest";
-const LABEL = "os-sandbox";
+const IMAGE = process.env.OSB_IMAGE ?? "omarchy-sandbox:latest";
+const LABEL = "omarchy-sandbox";
 const VNC_PORT = "5900/tcp";
 // Keep tool output small enough for an agent's context.
 const MAX_OUTPUT = 40_000;
@@ -166,7 +166,7 @@ const windowMatch = z
 // --------------------------------------------------------------------------
 
 const server = new McpServer(
-  { name: "os-sandbox", version: "0.1.0" },
+  { name: "omarchy-sandbox", version: "0.1.0" },
   {
     instructions: [
       "Disposable Omarchy (Arch Linux + Hyprland) desktops for testing apps.",

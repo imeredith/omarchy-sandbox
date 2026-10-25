@@ -3,7 +3,7 @@
 //   node test/smoke.mjs [sandbox]      (default "smoke"; started and stopped here
 //                                       unless it is already running)
 //
-// Needs the image built (OSB_IMAGE, default os-sandbox:latest) and `npm run build`.
+// Needs the image built (OSB_IMAGE, default omarchy-sandbox:latest) and `npm run build`.
 
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -15,7 +15,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const sandbox = process.argv[2] ?? "smoke";
 const server = fileURLToPath(new URL("../dist/server.js", import.meta.url));
-const client = new Client({ name: "os-sandbox-smoke", version: "0" });
+const client = new Client({ name: "omarchy-sandbox-smoke", version: "0" });
 await client.connect(new StdioClientTransport({ command: process.execPath, args: [server], stderr: "inherit" }));
 
 async function call(name, args = {}) {

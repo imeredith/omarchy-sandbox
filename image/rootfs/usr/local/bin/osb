@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""osb: run and drive the Omarchy VM inside an os-sandbox container.
+"""osb: run and drive the Omarchy VM inside an omarchy-sandbox container.
 
 The container's entrypoint is `osb boot`, which starts QEMU. Everything else
 talks to that VM: input and screenshots go through QEMU's QMP socket (so they

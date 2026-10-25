@@ -15,10 +15,6 @@
 ARG ARCH_IMAGE=archlinux:latest
 FROM ${ARCH_IMAGE}
 
-LABEL org.opencontainers.image.title="os-sandbox" \
-      org.opencontainers.image.description="Omarchy (Arch + Hyprland) desktop in a QEMU VM, driven by agents through osb and the os-sandbox MCP server" \
-      org.opencontainers.image.licenses="MIT"
-
 # Bootstrap the Omarchy repo and keyring, then restore signature checking.
 # pacman-key --init makes a local master key to sign the distribution keys
 # with. Its secret half is deleted in this same layer, as the archlinux image
@@ -107,7 +103,7 @@ RUN bash /usr/share/omarchy/install/login/sddm.sh \
 
 # Predictable coordinates for agents: one monitor at scale 1.
 RUN cat > /home/omarchy/.config/hypr/monitors.lua <<'EOF' && chown omarchy:omarchy /home/omarchy/.config/hypr/monitors.lua
--- os-sandbox: the VM has one virtio display; keep scale at 1 so screenshot
+-- omarchy-sandbox: the VM has one virtio display; keep scale at 1 so screenshot
 -- pixels map 1:1 onto pointer coordinates.
 hl.env("GDK_SCALE", "1")
 hl.monitor({ output = "", mode = "preferred", position = "auto", scale = 1 })
@@ -139,3 +135,8 @@ ENV OSB_WIDTH=1280 \
 EXPOSE 5900
 VOLUME ["/workspace"]
 ENTRYPOINT ["/usr/local/bin/osb", "boot"]
+
+# Last, so editing labels doesn't invalidate the package layers.
+LABEL org.opencontainers.image.title="omarchy-sandbox" \
+      org.opencontainers.image.description="Omarchy (Arch + Hyprland) desktop in a QEMU VM, driven by agents through osb and the omarchy-sandbox MCP server" \
+      org.opencontainers.image.licenses="MIT"

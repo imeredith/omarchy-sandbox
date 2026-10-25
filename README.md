@@ -1,18 +1,15 @@
-# os-sandbox
+# omarchy-sandbox
 
-A Docker container that runs Linux distros as sandboxes where agents can build
-and test desktop apps.
+A Docker image that runs a throwaway [Omarchy](https://omarchy.org) desktop
+(Arch Linux + Hyprland) where agents can build and test desktop apps.
 
-> **Status:** early development. The first sandbox is
-> [Omarchy](https://omarchy.org) (Arch Linux + Hyprland), driven by the `osb`
-> CLI inside the container and by an MCP server on the host.
+> **Status:** early development. The desktop is driven by the `osb` CLI inside
+> the container and by an MCP server on the host.
 
 ## Goals
 
-- **Disposable environments:** start a clean Linux desktop in a container, use
-  it, and throw it away.
-- **Multiple distros:** support several distros so apps can be built and
-  tested on each target.
+- **Disposable environments:** start a clean Omarchy desktop in a container,
+  use it, and throw it away.
 - **Usable by agents:** agents can install dependencies, build an app, launch
   it, and check its UI (for example with screenshots and input) without
   touching the host.
@@ -56,7 +53,7 @@ host ── docker exec osb … ──▶ container: osb ──QMP──▶ QEMU
 Build it from the `image/` directory:
 
 ```sh
-docker build -t os-sandbox image/
+docker build -t omarchy-sandbox image/
 ```
 
 The image contains Omarchy plus the desktop part of its ISO package list:
@@ -75,7 +72,7 @@ docker run -d --init --name osb-default \
   --stop-timeout 30 \
   -p 127.0.0.1:5900:5900 \
   -v "$PWD:/workspace" \
-  os-sandbox
+  omarchy-sandbox
 
 docker exec osb-default osb wait     # blocks until the desktop is up (about 15 s with KVM)
 ```
@@ -168,7 +165,7 @@ npm run build
 Register it with Claude Code:
 
 ```sh
-claude mcp add os-sandbox -- node /path/to/os-sandbox/mcp/dist/server.js
+claude mcp add omarchy-sandbox -- node /path/to/omarchy-sandbox/mcp/dist/server.js
 ```
 
 Or with any client that takes an `mcpServers` JSON config:
@@ -176,10 +173,10 @@ Or with any client that takes an `mcpServers` JSON config:
 ```json
 {
   "mcpServers": {
-    "os-sandbox": {
+    "omarchy-sandbox": {
       "command": "node",
-      "args": ["/path/to/os-sandbox/mcp/dist/server.js"],
-      "env": { "OSB_IMAGE": "os-sandbox:latest" }
+      "args": ["/path/to/omarchy-sandbox/mcp/dist/server.js"],
+      "env": { "OSB_IMAGE": "omarchy-sandbox:latest" }
     }
   }
 }
@@ -187,13 +184,13 @@ Or with any client that takes an `mcpServers` JSON config:
 
 Environment variables:
 
-- `OSB_IMAGE`: the image to run (default `os-sandbox:latest`).
+- `OSB_IMAGE`: the image to run (default `omarchy-sandbox:latest`).
 - `OSB_DOCKER`: the docker binary (default `docker`).
 - `OSB_VNC_PASSWORD`: if set, passed to new sandboxes as their VNC password.
 
 Every tool takes an optional `sandbox` name (default `"default"`), so an agent
 can run several sandboxes at once. Each sandbox is a container named
-`osb-<name>` with the label `os-sandbox`, and VNC is published on a random
+`osb-<name>` with the label `omarchy-sandbox`, and VNC is published on a random
 localhost port that `sandbox_start` and `status` report.
 
 | Tool | Purpose |
@@ -236,17 +233,17 @@ The image holds no secrets, so it can be pushed to a public registry:
 For example, to GitHub's registry (with a token that has `write:packages`):
 
 ```sh
-docker build -t ghcr.io/<owner>/os-sandbox:latest \
-  --label org.opencontainers.image.source=https://github.com/<owner>/os-sandbox \
+docker build -t ghcr.io/<owner>/omarchy-sandbox:latest \
+  --label org.opencontainers.image.source=https://github.com/<owner>/omarchy-sandbox \
   image/
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u <owner> --password-stdin
-docker push ghcr.io/<owner>/os-sandbox:latest
+docker push ghcr.io/<owner>/omarchy-sandbox:latest
 ```
 
 The source label links the package to its repository. Then point the MCP
-server at it with `OSB_IMAGE=ghcr.io/<owner>/os-sandbox:latest`. Arch is a
+server at it with `OSB_IMAGE=ghcr.io/<owner>/omarchy-sandbox:latest`. Arch is a
 rolling release, so rebuild and push from time to time. To add packages to a
-published image, build `FROM ghcr.io/<owner>/os-sandbox` and run
+published image, build `FROM ghcr.io/<owner>/omarchy-sandbox` and run
 `pacman -Syu --noconfirm <packages>`.
 
 ## License
